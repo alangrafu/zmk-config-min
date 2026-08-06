@@ -11,9 +11,11 @@ on: [push, pull_request, workflow_dispatch]
 #   - $GITEA_ENV replaces $GITHUB_ENV
 #   - artifact upload is done by hand against the Actions runtime API
 #
-# NOTE: the matrix below is a hand-maintained copy of build.yaml. The GitHub
-# workflow reads build.yaml directly; this one cannot (that needs actions/checkout
-# + remarshal in a separate job). If you edit build.yaml, edit this too.
+# NOTE: this matrix is deliberately a SUBSET of build.yaml — just the two halves
+# you actually flash. build.yaml (used by the GitHub workflow) still builds all
+# eight variants; the dongle/prospector/settings_reset builds are only there.
+# Anything added here must be added by hand — this workflow cannot read
+# build.yaml (that needs actions/checkout + remarshal in a separate job).
 #
 # Requires the GIT_SECRET repo secret (a Gitea token that can clone this repo).
 
@@ -32,36 +34,10 @@ jobs:
             snippet: studio-rpc-usb-uart
             cmake-args: -DCONFIG_ZMK_STUDIO=y -DCONFIG_ZMK_STUDIO_LOCKING=n -DCONFIG_ZMK_BLE_EXPERIMENTAL_CONN=y
             artifact-name: corne_min_left_with_studio
-          - board: corne_min_left
-            shield: rgbled_adapter
-            snippet: studio-rpc-usb-uart
-            cmake-args: -DCONFIG_ZMK_STUDIO=y -DCONFIG_ZMK_STUDIO_LOCKING=n -DCONFIG_ZMK_BLE_EXPERIMENTAL_CONN=y -DCONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_FETCHING=y -DCONFIG_ZMK_SPLIT_BLE_CENTRAL_BATTERY_LEVEL_PROXY=y
-            artifact-name: corne_min_left_with_studio_and_peripheral_battery_reporting
           - board: corne_min_right
             shield: rgbled_adapter
             cmake-args: -DCONFIG_ZMK_BLE_EXPERIMENTAL_CONN=y
             artifact-name: corne_min_right
-
-          - board: seeeduino_xiao_ble
-            shield: corne_min_dongle prospector_adapter
-            snippet: studio-rpc-usb-uart
-            cmake-args: -DCONFIG_ZMK_STUDIO=y -DCONFIG_ZMK_STUDIO_LOCKING=n
-            artifact-name: prospector_for_corne_min
-          - board: seeeduino_xiao_ble
-            shield: settings_reset
-            artifact-name: prospector_settings_reset
-
-          - board: corne_min_left
-            shield: rgbled_adapter
-            cmake-args: -DCONFIG_ZMK_SPLIT=y -DCONFIG_ZMK_SPLIT_ROLE_CENTRAL=n
-            artifact-name: corne_min_left_for_prospector
-          - board: corne_min_right
-            shield: rgbled_adapter
-            cmake-args: -DCONFIG_ZMK_SPLIT=y -DCONFIG_ZMK_SPLIT_ROLE_CENTRAL=n
-            artifact-name: corne_min_right_for_prospector
-          - board: corne_min_left
-            shield: settings_reset
-            artifact-name: corne_min_settings_reset
     steps:
       - name: Debug matrix
         run: |
@@ -173,7 +149,8 @@ jobs:
           ARTIFACT_NAME: artifact-${{ env.artifact_name }}
           ARTIFACT_DIR: ${{ env.build_dir }}/artifacts
         run: |
-          import urllib.request, json, os, glob, sys, hashlib, base64
+          import urllib.request, urllib.parse, urllib.error
+          import json, os, glob, sys, hashlib, base64
 
           runtime_url   = os.environ.get('ACTIONS_RUNTIME_URL', '')
           runtime_token = os.environ.get('ACTIONS_RUNTIME_TOKEN', '')
@@ -187,30 +164,59 @@ jobs:
 
           auth = {'Authorization': f'Bearer {runtime_token}'}
 
+          def send(req, what):
+              """urlopen that prints the server's error body. A bare 'HTTP 400' tells
+              us nothing; Gitea puts the actual reason in the response body."""
+              try:
+                  return urllib.request.urlopen(req)
+              except urllib.error.HTTPError as e:
+                  body = e.read().decode('utf-8', 'replace')
+                  print(f'FAILED: {what}', file=sys.stderr)
+                  print(f'  HTTP {e.code} {e.reason}', file=sys.stderr)
+                  print(f'  {req.get_method()} {req.full_url}', file=sys.stderr)
+                  for k, v in req.headers.items():
+                      if k.lower() != 'authorization':
+                          print(f'  > {k}: {v}', file=sys.stderr)
+                  print(f'  < body: {body[:2000]}', file=sys.stderr)
+                  raise
+
+          files = [f for f in sorted(glob.glob(os.path.join(artifact_dir, '*'))) if os.path.isfile(f)]
+          if not files:
+              print(f'ERROR: nothing to upload in {artifact_dir}', file=sys.stderr)
+              sys.exit(1)
+          print('to upload:', [f'{os.path.basename(f)} ({os.path.getsize(f)}b)' for f in files])
+
           # 1. Create artifact container
           req = urllib.request.Request(
               f'{runtime_url}_apis/pipelines/workflows/{run_id}/artifacts?api-version=6.0-preview',
               data=json.dumps({'type': 'actions_storage', 'name': artifact_name}).encode(),
               headers={**auth, 'Content-Type': 'application/json'}, method='POST')
-          with urllib.request.urlopen(req) as r:
+          with send(req, 'create artifact container') as r:
               container = json.loads(r.read())
 
           file_url = container['fileContainerResourceUrl']
-          total    = 0
-          items    = []
+          print('fileContainerResourceUrl:', file_url)
+
+          # Gitea has returned this URL both with and without an existing query
+          # string; blindly appending '?itemPath=' produces a double '?' and a 400.
+          sep   = '&' if '?' in file_url else '?'
+          total = 0
 
           # 2. Upload each file — Gitea requires x-tfs-filelength and x-actions-results-md5
-          for f in sorted(glob.glob(os.path.join(artifact_dir, '*'))):
-              if not os.path.isfile(f):
-                  continue
+          for f in files:
               fname = os.path.basename(f)
               with open(f, 'rb') as fp:
                   data = fp.read()
-              n       = len(data)
+              n = len(data)
+              if n == 0:
+                  # 'Content-Range: bytes 0--1/0' is malformed and Gitea 400s on it
+                  print(f'  skipping empty {fname}', file=sys.stderr)
+                  continue
               total  += n
               md5_b64 = base64.b64encode(hashlib.md5(data).digest()).decode()
+              item    = urllib.parse.quote(f'{artifact_name}/{fname}')
               req = urllib.request.Request(
-                  f'{file_url}?itemPath={artifact_name}/{fname}', data=data,
+                  f'{file_url}{sep}itemPath={item}', data=data,
                   headers={
                       **auth,
                       'Content-Type': 'application/octet-stream',
@@ -218,15 +224,14 @@ jobs:
                       'x-tfs-filelength': str(n),
                       'x-actions-results-md5': md5_b64,
                   }, method='PUT')
-              urllib.request.urlopen(req)
-              items.append({'path': f'{artifact_name}/{fname}', 'itemType': 'file', 'contentLocation': f'{file_url}?itemPath={artifact_name}/{fname}'})
+              send(req, f'upload {fname} ({n} bytes)').close()
               print(f'  uploaded {fname} ({n} bytes)')
 
           # 3. Finalise
-          finalize_url = f'{runtime_url}_apis/pipelines/workflows/{run_id}/artifacts?api-version=6.0-preview&artifactName={artifact_name}'
           req = urllib.request.Request(
-              finalize_url,
+              f'{runtime_url}_apis/pipelines/workflows/{run_id}/artifacts'
+              f'?api-version=6.0-preview&artifactName={urllib.parse.quote(artifact_name)}',
               data=json.dumps({'size': total}).encode(),
               headers={**auth, 'Content-Type': 'application/json'}, method='PATCH')
-          urllib.request.urlopen(req)
+          send(req, 'finalise artifact').close()
           print(f'Artifact "{artifact_name}" ready ({total} bytes)')
